@@ -219,7 +219,8 @@ function initSchema(d) {
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
-  -- 出货单状态版本：每次创建出货单 / 出货单转待评估 / 登记处置时 +1。
+  -- 出货单状态版本：每次创建出货单 / 出货单转待评估 / 登记处置 /
+  -- 批次生效隔离令集合变化（签发、解除或事件更正改变流向）时 +1。
   -- 质量处置接口要求提交查询时取得的版本，事务内与最新版本核对，过期拒绝且不产生记录。
   CREATE TABLE IF NOT EXISTS shipment_versions (
     -- 出货单从不删除；不加外键以便与只增不改的处置记录保持同一保留语义。

@@ -912,8 +912,9 @@ curl -s http://localhost:3000/api/shipment-balances   # 受控批次同样 quara
   - **准予条件判定**：三条条件逐项 ✓/✗ 及未覆盖的过敏原。
 - **准予继续流转仅在三条同时成立时允许**：① 批次仍存在且可重新推导；② 当前有有效放行；
   ③ **出货快照覆盖当前过敏原**（当前集合是出货声明集合的子集，未声明项会逐条列出）。任一不满足，只能**召回**。
-- 提交在**一次事务**内重新核对：版本签名与有效期、该单**最新状态版本**、**最新上下文指纹**
-  （批次过敏原/有效放行/所用卷停用）。过期或查询后已被改动 → `409 VERSION_EXPIRED`，**拒绝且不产生记录**。
+- 提交在**一次事务**内重新核对：版本签名与有效期、该单**最新状态版本**、**最新版本指纹**
+  （批次过敏原/有效放行/所用卷停用 + **批次生效隔离令集合**）。过期或查询后已被改动 →
+  `409 VERSION_EXPIRED`，**拒绝且不产生记录**。
 - **记录只增不改**：同一单已有**有效（ACTIVE）结论**时重复提交一律拒绝
   （`409 DISPOSITION_EXISTS`，**用旧版本也不能覆盖新结论**）；处置行从不修改结论内容。
 - 此后**批次过敏原、有效放行或所用卷停用信息变化**时（事件/原料更正、整组换线确认应用、放行新增或删除），
@@ -925,10 +926,12 @@ curl -s http://localhost:3000/api/shipment-balances   # 受控批次同样 quara
 
 ### 状态版本（乐观并发）
 
-- 状态版本为**每单单调递增整数**（出货时 0；转待评估 +1；每次登记处置 +1），
+- 状态版本为**每单单调递增整数**（出货时 0；转待评估 +1；每次登记处置 +1；
+  **批次生效隔离令集合变化 +1**——签发、解除或事件更正改变流向时，见
+  [「隔离令联动评估状态版本」](#隔离令联动评估状态版本本轮修复)），
   评估视图同时返回一枚 **HMAC 签名令牌**（30 分钟有效；**服务重启后旧令牌作废**）与短码 `context_version`。
-- 查询后若该单状态版本被推进（他人先处置、单据新转待评估）或上下文指纹变化，
-  旧令牌提交即拒绝；处置成功后旧令牌立即失效。
+- 查询后若该单状态版本被推进（他人先处置、单据新转待评估、批次生效隔离令集合变化）
+  或版本指纹变化，旧令牌提交即拒绝；处置成功后旧令牌立即失效。
 
 ### HTTP API
 
@@ -1013,7 +1016,7 @@ curl -s http://localhost:3000/api/shipments/SHIP-0001/evaluation
 | 出货单不存在（评估/处置） | 404 | `SHIPMENT_NOT_FOUND` |
 | 非待评估单提交处置 | 409 | `SHIPMENT_NOT_REVIEWABLE` |
 | 条件不满足仍提交 CONTINUE | 409 | `CONTINUE_NOT_ALLOWED`（`details` 逐条原因） |
-| 版本过期（TTL/状态版本已前进/查询后上下文变化），**不产生记录** | 409 | `VERSION_EXPIRED` |
+| 版本过期（TTL/状态版本已前进/查询后上下文或生效隔离令集合变化），**不产生记录** | 409 | `VERSION_EXPIRED` |
 | 已有有效结论，重复提交（含旧版本）不得覆盖 | 409 | `DISPOSITION_EXISTS` |
 
 ## 原料供应批号与流向追溯（本轮新增）
@@ -1488,6 +1491,8 @@ curl -s -X DELETE http://localhost:3000/api/downtime-windows/3
   - **已有标签卷暂停贴用但不永久停用**：核销贴用/作废 `409 ROLL_QUARANTINED`，
     卷保持 `ACTIVE`，脱离全部生效令后自动恢复贴用；
   - **关联已出货单转待评估**（`PENDING_REVIEW`，终态不自动恢复），并推进该单状态版本；
+    **原本已待评估的单据同样推进状态版本**（生效隔离令集合已变化，变化前查询取得的
+    评估版本提交即 `409 VERSION_EXPIRED`，不产生处置记录）；
   - 这些出货单上**有效的“准予继续流转”结论转需重评**（STALE，召回结论不受影响）；
   - **隔离期间评估只能召回**：评估视图 `conditions.quarantined=true`，
     提交 `CONTINUE` 被 `409 CONTINUE_NOT_ALLOWED` 拒绝，`RECALL` 正常落账。
@@ -1495,7 +1500,9 @@ curl -s -X DELETE http://localhost:3000/api/downtime-windows/3
   （重复解除 `409 QUARANTINE_NOT_ACTIVE`），解除时的生效范围快照留痕（`lifted_scope`）。
   **批次脱离所有生效令后**才恢复放行/标签卷/出货登记与卷贴用，可出货余额随之恢复按
   「未停用卷剩余已贴用量」计算（多张令覆盖同一批次时，解除其中一张不足以恢复；停用卷始终为 0）；
-  **待评估单及历史处置结论不自动恢复**。
+  **待评估单及历史处置结论不自动恢复**。解除或事件更正使批次**生效隔离令集合变化**时，
+  该批全部出货单的状态版本同样推进：变化前查询取得的版本提交（含“准予继续流转”）
+  一律 `409 VERSION_EXPIRED`，须重新查询后按最新隔离状态判断。
 - **原子性**：签发、解除和范围变化与关联业务状态更新（出货单转待评估、结论转需重评）
   在**同一事务**内完成；任一环节失败整体回滚。
 - **台账只增不改**：隔离令永不删除；已签发过隔离令（含已解除历史令）的批号不可删除
@@ -1611,6 +1618,98 @@ curl -s http://localhost:3000/api/quarantine-orders/1
 | 受控批次的卷核销贴用/作废（暂停贴用，不永久停用） | 409 | `ROLL_QUARANTINED` |
 | 隔离期间提交“准予继续流转” | 409 | `CONTINUE_NOT_ALLOWED` |
 | 批号已签发隔离令（含历史令）仍删除 | 400 | `LOT_IN_USE` |
+
+## 隔离令联动评估状态版本（本轮修复）
+
+待评估出货单按“先查询评估视图取得状态版本、再按该版本登记整单处置”流转。此前
+对**原本已待评估**的单据签发隔离令时不推进其状态版本，隔离状态也未进入版本指纹：
+查询后批次新受控，旧版本仍可提交召回；解除后旧版本仍可能提交继续流转。本轮修复：
+
+- **生效隔离令集合变化即推进状态版本**：签发、解除或事件更正（含断网补录、整组换线
+  确认应用）使某批次的生效隔离令集合（令 id + 分类）发生变化时，该批**全部出货单**
+  （含原本已待评估、本次无状态转换的单据）的状态版本在**同一事务**内 +1；
+  变化前查询取得的版本提交处置一律 `409 VERSION_EXPIRED` 且**不产生处置记录**。
+- **隔离令集合纳入提交版本指纹**：评估令牌的指纹在“批次过敏原/有效放行/所用卷停用”
+  之外并入批次生效隔离令集合，任何路径造成的集合变化都使旧令牌失效；
+  处置“需重评”核对仍沿用不含隔离令的上下文指纹——**解除隔离不翻动历史结论**
+  （新受控时仍由隔离级联显式把有效“准予继续流转”结论转需重评）。
+- **未受影响出货单的版本不无故失效**：批次不在变化范围（令集合未变）的出货单，
+  其状态版本与已签发令牌保持不变，查询取得的版本仍可正常提交。
+- **重新查询后按最新隔离状态判断**：隔离期间只能召回（`CONTINUE` 仍
+  `409 CONTINUE_NOT_ALLOWED`）；**脱离全部生效令后**才按原三条硬条件判断继续流转。
+- 既有 HTTP API 契约、响应形状与网页操作不变（页面提交遇 `VERSION_EXPIRED`
+  会自动重新查询最新评估视图）。
+
+#### 调用示例（curl，基于演示数据）
+
+演示库 `SHIP-0001` 属 `BATCH-003`（奶 B 批 `SUP-MILK-20260926-B` 批号 id=2 流向该批）。
+
+```bash
+# 0) 前置：删除 BATCH-003 的放行（演示库 #1），SHIP-0001 转待评估（版本 0→1）
+curl -s -X DELETE http://localhost:3000/api/releases/1
+# -> { ok:true, retired_rolls:[LABEL-0001…], pending_shipments:[SHIP-0001…] }
+
+# 1) 查询评估视图取得状态版本（版本 1，未受隔离）
+VER=$(curl -s http://localhost:3000/api/shipments/SHIP-0001/evaluation \
+  | node -pe 'JSON.parse(require("fs").readFileSync(0)).version')
+
+# 2) 签发隔离令：BATCH-002/003 受控；SHIP-0001 原本已待评估，版本仍推进 1→2
+curl -s -X POST http://localhost:3000/api/quarantine-orders \
+  -H 'Content-Type: application/json' -d '{
+    "lot_id": 2, "reason": "供应商通报该批可能混入异常原料，隔离待查",
+    "issued_by": "质检员-王敏", "issued_at": "2026-10-05T09:00" }'
+# -> quarantine.newly_controlled:[BATCH-002,BATCH-003]；pending_shipments:[]（本已待评估）
+
+# 3) 变化前版本提交（召回/继续流转）-> 均 409 VERSION_EXPIRED，不产生处置记录
+curl -s -X POST http://localhost:3000/api/shipments/SHIP-0001/dispositions \
+  -H 'Content-Type: application/json' \
+  -d "{\"decision\":\"RECALL\",\"decided_by\":\"质检-陈静\",\"basis\":\"旧版本提交\",\"version\":\"$VER\"}"
+# -> 409 { code:"VERSION_EXPIRED",
+#          error:"状态版本已过期：查询时版本为 1，当前最新版本为 2；…（本次不产生记录）" }
+
+# 4) 重新查询：隔离中只能召回（CONTINUE 仍 409 CONTINUE_NOT_ALLOWED），RECALL 落账
+VER=$(curl -s http://localhost:3000/api/shipments/SHIP-0001/evaluation \
+  | node -pe 'JSON.parse(require("fs").readFileSync(0)).version')
+curl -s -X POST http://localhost:3000/api/shipments/SHIP-0001/dispositions \
+  -H 'Content-Type: application/json' \
+  -d "{\"decision\":\"RECALL\",\"decided_by\":\"质检-陈静\",
+       \"basis\":\"批号隔离待查，先召回在途品\",\"version\":\"$VER\"}"
+# -> 200 RECALL 落账（版本推进到 3）
+
+# 5) 解除前再取版本；随后解除隔离令：批次脱离全部生效令，版本 3→4
+VER2=$(curl -s http://localhost:3000/api/shipments/SHIP-0001/evaluation \
+  | node -pe 'JSON.parse(require("fs").readFileSync(0)).version')
+curl -s -X POST http://localhost:3000/api/quarantine-orders/1/lift \
+  -H 'Content-Type: application/json' \
+  -d '{"lifted_by":"质检主管-刘芳","lift_reason":"供应商复检合格，解除隔离"}'
+# -> quarantine.released:[BATCH-002,BATCH-003]
+
+# 6) 解除后旧版本提交（含继续流转）-> 409 VERSION_EXPIRED；须重新查询
+curl -s -X POST http://localhost:3000/api/shipments/SHIP-0001/dispositions \
+  -H 'Content-Type: application/json' \
+  -d "{\"decision\":\"CONTINUE\",\"decided_by\":\"质检-陈静\",\"basis\":\"解除后旧版本\",\"version\":\"$VER2\"}"
+# -> 409 { code:"VERSION_EXPIRED" }（修复前此处可能直接落账）
+
+# 7) 重新查询后按最新隔离状态判断：已脱离全部生效令，
+#    登记有效放行使原三条硬条件成立后即可准予继续流转
+curl -s -X POST http://localhost:3000/api/releases \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":3,"released_at":"2026-10-05T10:00","released_by":"质检员-王敏(复核)"}'
+#    （原召回结论随有效放行变化标“需重新评估”，不自动生效）
+VER=$(curl -s http://localhost:3000/api/shipments/SHIP-0001/evaluation \
+  | node -pe 'JSON.parse(require("fs").readFileSync(0)).version')
+curl -s -X POST http://localhost:3000/api/shipments/SHIP-0001/dispositions \
+  -H 'Content-Type: application/json' \
+  -d "{\"decision\":\"CONTINUE\",\"decided_by\":\"质检-陈静\",
+       \"basis\":\"复检合格且新放行有效，准予继续流转\",\"version\":\"$VER\"}"
+# -> 200 CONTINUE 落账
+
+# 8) 事件更正同理：把受控批次的加工事件更正为正常批号，响应 quarantine.released
+#    含该批次，其出货单版本 +1，变化前版本提交即 409 VERSION_EXPIRED；
+#    批次不在任何生效令变化范围的出货单，版本与已签发令牌不受影响。
+```
+
+端到端测试：`npm run test:quarantine-version`。
 
 ## 批号库存计量（克）：期初结存 · 入库流水 · 领用余额（本轮新增）
 
@@ -1891,6 +1990,7 @@ npm run test:partial-clean # 端到端验证部分清洗：入参校验/只清�
 npm run test:backfill     # 端到端验证断网日志整包补录：整包事务/包内引用/幂等重试/外部记录号复用与冲突/重算联动（放行/卷/出货/处置）/对账（OK/MISMATCH/DELETED）/旧接口兼容
 npm run test:downtime     # 端到端验证设备检修停机窗口：登记/调整/取消/查询、左闭右开与相邻允许、覆盖事件整次拒绝、事件/补录/换线核对、幂等重试优先、停机不等于清洗
 npm run test:quarantine   # 端到端验证质量隔离令：签发/解除/重复拒绝、生效范围（确定命中+批号未知无法排除）与传播依据、受控约束（放行/卷/出货/暂停贴用/读侧可出货量统一为 0）、待评估与需重评级联、隔离期间只能召回、范围同步刷新、解除后恢复（余额按未停用卷剩余已贴量恢复，停用卷恒 0）
+npm run test:quarantine-version # 端到端验证隔离令联动评估状态版本：签发/解除/事件更正使生效令集合变化时旧版本 409 VERSION_EXPIRED 且不产生记录、原本已待评估单同样推进版本、重新查询后按最新隔离状态判断、未受影响单版本不失效
 npm run test:inventory    # 端到端验证批号库存计量（克）：期初一次非负整数/入库唯一单号正整数/流水只增不改、已计量批号输入必填正整数克数且累计领用≤期初+入库、未启用批号沿用旧规则、旧输入缺数量保留不计领用且更正须补量、事件更正/删除/补录/换线确认同事务重算余额不足整次拒绝、换线预演只展示不占用、补录重试/复用不重复领用、台账查询字段
 ```
 
@@ -1969,11 +2069,11 @@ server/
   recompute.js   # 推导引擎：回放事件、批次并集、设备残留（全清/部分清洗按过敏原清除）、放行核对、标签卷停用核对、出货单待评估核对
   labels.js      # 过敏原标签卷：三方一致登记、按修订号核销、永久停用
   shipments.js   # 包装出货：整单事务分配、快照保存、可出货余额（受控批次逐卷/合计按 0、原值保留）、待评估联动（不自动恢复）
-  evaluation.js  # 待评估单质量处置：评估视图、签名状态版本、整单结论事务提交、旧结论需重评核对
+  evaluation.js  # 待评估单质量处置：评估视图、签名状态版本（版本指纹含批次生效隔离令集合）、整单结论事务提交、旧结论需重评核对
   lots.js        # 原料供应批号：档案登记/标记/删除、投料批号解析（不存在/不匹配明确拒绝）
   trace.js       # 批号流向追溯：逐时回放（直接投料/前序引用/设备残留；全清截断、部分清洗按来源过敏原逐次截断）、确定命中与批号未知无法排除、关联出货单
   backfill.js    # 断网日志整包补录：有序记录（外部记录号/时间/设备，加工含产出批次/原料批号可未知/引用批次，清洗省略范围=全清非空=部分）；整包事务校验+重算；同批号同内容幂等、同号复用/冲突拒绝；补录批号对账（OK/MISMATCH/DELETED）
-  quarantine.js  # 质量隔离令：签发/解除（原因/操作人/时间留痕，同批号同时一张生效令）；按当前时间线批号流向确定生效范围（确定命中+批号未知无法排除，含传播依据）并随重算同步刷新；受控批次禁放行/禁登记卷/禁出货、已有卷暂停贴用（不永久停用）、关联出货单转待评估、有效继续流转结论转需重评、隔离期间只能召回；脱离所有生效令后恢复
+  quarantine.js  # 质量隔离令：签发/解除（原因/操作人/时间留痕，同批号同时一张生效令）；按当前时间线批号流向确定生效范围（确定命中+批号未知无法排除，含传播依据）并随重算同步刷新；受控批次禁放行/禁登记卷/禁出货、已有卷暂停贴用（不永久停用）、关联出货单转待评估、有效继续流转结论转需重评、隔离期间只能召回；脱离所有生效令后恢复；生效令集合变化时联动推进相关出货单状态版本
   inventory.js   # 批号库存计量（克）：期初实物结存（每批号一次、非负整数）、入库流水（唯一单号、正整数、只增不改）；按批号累计领用≤期初+入库的写入侧校验与最终状态全量校验；台账（期初/入库/领用/可用量/未计量旧输入数）
   replan.js      # 整组换线：影子库预演、业务版本签名令牌、事务确认应用（update/insert_clean 支持 clean_allergens 清洗范围；update 支持 material_inputs 带批号与克数；预演 diff.lot_inventory 只展示批号余额差异不占用库存）
   timeutil.js    # 事件时间文本归一化：分钟写法 09:00 与带秒 09:00:00 按同一实际时刻比较/排序（同设备冲突、批次引用先后、回放与停机窗口共用）
@@ -1992,6 +2092,7 @@ scripts/
   test-backfill.js   # 断网日志整包补录：整包事务/包内引用/幂等/外部记录号复用与冲突/重算联动/对账/旧接口兼容 端到端测试
   test-downtime.js   # 设备检修停机窗口：登记/调整/取消/查询、重叠与相邻、覆盖事件整次拒绝、事件/补录/换线核对、幂等重试优先、停机不等于清洗 端到端测试
   test-quarantine.js # 质量隔离令：签发/解除/重复拒绝、生效范围与传播依据、受控约束、待评估与需重评级联、隔离期间只能召回、范围同步刷新、解除后恢复 端到端测试
+  test-quarantine-version.js # 隔离令联动评估状态版本：签发/解除/事件更正使生效令集合变化时旧版本 409 且不产生记录、已待评估单同样推进版本、未受影响单版本不失效 端到端测试
   test-inventory.js  # 批号库存计量（克）：期初/入库/非法与重复拒绝、必填正整数克数与累计领用余额、旧输入补量、更正删除补录换线同事务重算与预演不占用、重试复用不重复领用、台账查询 端到端测试
   test-time-instants.js # 时间写法按实际时刻判定：同设备同刻异写冲突/同刻引用拒绝（单条新增更正、断网补录、换线预演确认）、异时合法变更重算、原文保留、补录幂等与预演版本约定 端到端测试
 Dockerfile  docker-compose.yml

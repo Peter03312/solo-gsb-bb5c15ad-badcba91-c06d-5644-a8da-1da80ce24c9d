@@ -11,7 +11,8 @@
 //        - 仅待评估单可提交；
 //        - CONTINUE（准予继续流转）仅在「批次仍存在且可推导 + 当前有有效放行 +
 //          出货快照覆盖当前过敏原」三条同时成立时允许，否则只能 RECALL（召回）；
-//        - 必须携带查询取得的 version；事务内重新核对签名、TTL、最新状态版本与上下文指纹，
+//        - 必须携带查询取得的 version；事务内重新核对签名、TTL、最新状态版本与版本指纹
+//          （批次过敏原/有效放行/所用卷停用 + 批次生效隔离令集合），
 //          过期/被并发改动则 409 VERSION_EXPIRED 拒绝且不产生任何记录；
 //        - 同一单已存在有效（ACTIVE）结论时拒绝重复提交（旧版本不得覆盖新结论）。
 //
@@ -203,8 +204,9 @@ function buildContext(db, s) {
   ctx.has_active_release = ctx.active_releases.length > 0;
 
   // 质量隔离令：批次处于任一隔离令生效范围时，隔离期间只能召回（不准予继续流转）。
-  // 隔离状态不纳入上下文指纹：新受控时由隔离级联显式把有效“准予继续流转”结论转需重评，
-  // 解除时不自动改动任何历史结论。
+  // 生效令集合纳入“提交版本指纹”（versionFingerprint）：签发/解除/事件更正使集合变化时，
+  // 变化前查询取得的版本即失效；但不纳入 contextHash——处置“需重评”核对不受影响：
+  // 新受控时由隔离级联显式把有效“准予继续流转”结论转需重评，解除时不翻动任何历史结论。
   if (ctx.batch_exists) {
     const quarantine = require('./quarantine');
     const qOrders = quarantine.batchOrders(db, s.batch_id);
@@ -245,6 +247,20 @@ function contextHash(ctx) {
     })).sort((a, b) => a.roll_id - b.roll_id)
   };
   return crypto.createHash('sha256').update(canonicalString(payload)).digest('hex');
+}
+
+// 提交版本指纹：评估上下文指纹 ∪ 批次生效隔离令集合（令 id + 分类）。
+// 签发/解除/事件更正（含补录、整组换线）使批次生效隔离令集合变化时，
+// 变化前查询签发的版本令牌即失效（409 VERSION_EXPIRED，不产生处置记录）；
+// 未受影响批次的出货单版本指纹不变。处置“需重评”核对（syncStaleDispositions）
+// 仍只用 contextHash（不含隔离令）：解除隔离不翻动历史结论。
+function versionFingerprint(ctx) {
+  const quarantine = (ctx.quarantine_orders || [])
+    .map((o) => [o.order_id, o.classification])
+    .sort((a, b) => (a[0] - b[0]) || String(a[1]).localeCompare(String(b[1])));
+  return crypto.createHash('sha256')
+    .update(canonicalString({ context: contextHash(ctx), quarantine }))
+    .digest('hex');
 }
 
 // ---------- 条件不满足的中文原因 ----------
@@ -313,8 +329,7 @@ function getEvaluation(db, idOrCode) {
   if (!s) throw new EvaluationError('SHIPMENT_NOT_FOUND', '出货单不存在');
   const row = db.prepare('SELECT * FROM shipments WHERE id = ?').get(s.id);
   const ctx = buildContext(db, row);
-  const hash = contextHash(ctx);
-  const token = issueVersion(db, s.id, hash);
+  const token = issueVersion(db, s.id, versionFingerprint(ctx));
   const history = listDispositions(db, s.id);
   const current = history.length ? history[history.length - 1] : null;
 
@@ -423,14 +438,17 @@ function submitDisposition(db, idOrCode, body) {
       );
     }
     const ctx = buildContext(db, row);
-    const hash = contextHash(ctx);
-    if (hash !== payload.ctx) {
+    // 版本指纹含批次生效隔离令集合：查询后签发/解除隔离令或事件更正改变流向，
+    // 旧版本在此即被拒（不产生记录）；处置留痕与“需重评”核对仍用不含隔离令的上下文指纹。
+    const fingerprint = versionFingerprint(ctx);
+    if (fingerprint !== payload.ctx) {
       throw new EvaluationError(
         'VERSION_EXPIRED',
-        '查询后批次过敏原、有效放行或所用卷停用信息已变化，该状态版本已过期；' +
+        '查询后批次过敏原、有效放行、所用卷停用信息或生效隔离令集合已变化，该状态版本已过期；' +
         '请重新查询获取最新版本后再提交（本次不产生记录）'
       );
     }
+    const hash = contextHash(ctx);
 
     // 记录只增不改：已有有效结论时一律拒绝（重复用旧版本也不得覆盖新结论）。
     const latest = db.prepare(
@@ -585,6 +603,7 @@ module.exports = {
   EvaluationError,
   buildContext,
   contextHash,
+  versionFingerprint,
   currentVersion,
   bumpVersion,
   getEvaluation,
