@@ -236,7 +236,7 @@ function createShipment(db, body) {
     db.prepare('UPDATE shipments SET shipment_code = ? WHERE id = ?')
       .run(shipment_code, inserted.id);
 
-    // 出货单状态版本从 0 起步；转待评估、登记质量处置时各推进一次。
+    // 出货单状态版本从 0 起步；转待评估、登记质量处置或批次生效隔离令集合变化时各推进一次。
     db.prepare('INSERT INTO shipment_versions (shipment_id, version) VALUES (?, 0)')
       .run(inserted.id);
 

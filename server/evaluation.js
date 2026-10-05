@@ -11,9 +11,14 @@
 //        - 仅待评估单可提交；
 //        - CONTINUE（准予继续流转）仅在「批次仍存在且可推导 + 当前有有效放行 +
 //          出货快照覆盖当前过敏原」三条同时成立时允许，否则只能 RECALL（召回）；
-//        - 必须携带查询取得的 version；事务内重新核对签名、TTL、最新状态版本与上下文指纹，
-//          过期/被并发改动则 409 VERSION_EXPIRED 拒绝且不产生任何记录；
+//        - 必须携带查询取得的 version；事务内重新核对签名、TTL、最新状态版本与版本指纹
+//          （上下文指纹 + 批次“生效隔离令集合”指纹），过期/被并发改动则 409 VERSION_EXPIRED
+//          拒绝且不产生任何记录；
 //        - 同一单已存在有效（ACTIVE）结论时拒绝重复提交（旧版本不得覆盖新结论）。
+//
+// 版本失效时机：转待评估、登记处置、批次生效隔离令集合变化（隔离令签发/解除、
+//   事件更正/重算导致范围刷新）均推进该单整数状态版本；隔离状态同时进入版本指纹。
+//   仅批次生效令集合实际变化的出货单受影响，未受影响出货单版本不无故失效。
 //
 // 记录只增不改：shipment_dispositions 行只插入，从不 UPDATE 结论内容。
 //   此后批次过敏原、有效放行或所用卷停用信息变化（重算 / 放行新增或删除）时，
@@ -203,8 +208,8 @@ function buildContext(db, s) {
   ctx.has_active_release = ctx.active_releases.length > 0;
 
   // 质量隔离令：批次处于任一隔离令生效范围时，隔离期间只能召回（不准予继续流转）。
-  // 隔离状态不纳入上下文指纹：新受控时由隔离级联显式把有效“准予继续流转”结论转需重评，
-  // 解除时不自动改动任何历史结论。
+  // 当前生效令 id 集合同时用于版本指纹（见 quarantineHash）：签发、解除或事件更正
+  // 使该集合变化时，变化前取得的版本立即过期（提交 409 VERSION_EXPIRED）。
   if (ctx.batch_exists) {
     const quarantine = require('./quarantine');
     const qOrders = quarantine.batchOrders(db, s.batch_id);
@@ -226,6 +231,9 @@ function buildContext(db, s) {
 }
 
 // 仅纳入“准予/召回结论是否仍站得住”的要素；展示性字段不放进来。
+// 注意：不含隔离状态——旧结论是否需重评沿用隔离级联规则（隔离只令 ACTIVE 的 CONTINUE
+// 转 STALE，召回结论与解除时的历史结论不自动改动）；隔离状态由 quarantineHash 单独
+// 进入“提交用版本指纹”，不影响处置生命周期判定。
 function contextHash(ctx) {
   const payload = {
     batch_exists: ctx.batch_exists,
@@ -245,6 +253,22 @@ function contextHash(ctx) {
     })).sort((a, b) => a.roll_id - b.roll_id)
   };
   return crypto.createHash('sha256').update(canonicalString(payload)).digest('hex');
+}
+
+// 批次“生效隔离令集合”指纹：以生效令 id 的有序集合表征。
+// 签发（集合增大）、解除（集合减小或清空）、事件更正重算范围（集合增删）都会改变它；
+// 仅多令覆盖的分类/依据变化而生效令集合不变时不影响版本（隔离结论未变）。
+function quarantineHash(ctx) {
+  const ids = ctx.quarantine_orders.map((o) => o.order_id).sort((a, b) => a - b);
+  return crypto.createHash('sha256')
+    .update(canonicalString({ quarantine_order_ids: ids })).digest('hex');
+}
+
+// 提交用版本指纹 = 上下文指纹 + 生效隔离令集合指纹。
+// 查询令牌携带该值；提交事务内按最新状态重算核对，任一变化即 VERSION_EXPIRED。
+function versionFingerprint(ctx) {
+  return crypto.createHash('sha256')
+    .update(contextHash(ctx) + ':' + quarantineHash(ctx)).digest('hex');
 }
 
 // ---------- 条件不满足的中文原因 ----------
@@ -313,8 +337,7 @@ function getEvaluation(db, idOrCode) {
   if (!s) throw new EvaluationError('SHIPMENT_NOT_FOUND', '出货单不存在');
   const row = db.prepare('SELECT * FROM shipments WHERE id = ?').get(s.id);
   const ctx = buildContext(db, row);
-  const hash = contextHash(ctx);
-  const token = issueVersion(db, s.id, hash);
+  const token = issueVersion(db, s.id, versionFingerprint(ctx));
   const history = listDispositions(db, s.id);
   const current = history.length ? history[history.length - 1] : null;
 
@@ -423,12 +446,11 @@ function submitDisposition(db, idOrCode, body) {
       );
     }
     const ctx = buildContext(db, row);
-    const hash = contextHash(ctx);
-    if (hash !== payload.ctx) {
+    if (versionFingerprint(ctx) !== payload.ctx) {
       throw new EvaluationError(
         'VERSION_EXPIRED',
-        '查询后批次过敏原、有效放行或所用卷停用信息已变化，该状态版本已过期；' +
-        '请重新查询获取最新版本后再提交（本次不产生记录）'
+        '查询后批次过敏原、有效放行、所用卷停用信息或生效隔离令集合已变化，' +
+        '该状态版本已过期；请重新查询获取最新版本后再提交（本次不产生记录）'
       );
     }
 
@@ -461,6 +483,9 @@ function submitDisposition(db, idOrCode, body) {
       batch_allergens: ctx.batch_allergens,
       snapshot_allergens: ctx.snapshot_allergens,
       active_release_ids: ctx.active_releases.map((r) => r.id),
+      // 登记时批次生效隔离令集合（留痕展示）；context_hash 仍只存上下文指纹，
+      // 隔离集合变化不直接把历史结论标 STALE（其生命周期由隔离级联规则决定）。
+      quarantine_order_ids: ctx.quarantine_orders.map((o) => o.order_id).sort((a, b) => a - b),
       used_rolls: ctx.used_rolls.map((r) => ({
         roll_id: r.roll_id, roll_code: r.roll_code, status: r.status,
         retired_reason: r.retired_reason, release_id: r.release_id,
@@ -474,7 +499,7 @@ function submitDisposition(db, idOrCode, body) {
           context_hash, context_snapshot, status_version, life_status, stale_reason, decided_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'ACTIVE', '', COALESCE(?, datetime('now')))`
     ).run(s.id, decision, decided_by, basis, payload.ver,
-          hash, JSON.stringify(snapshotForHistory), decided_at || null).lastInsertRowid;
+          contextHash(ctx), JSON.stringify(snapshotForHistory), decided_at || null).lastInsertRowid;
 
     // 处置落账即推进该单状态版本（旧版本立即作废，不能再用）。
     const newVersion = bumpVersion(db, s.id);
@@ -585,6 +610,8 @@ module.exports = {
   EvaluationError,
   buildContext,
   contextHash,
+  quarantineHash,
+  versionFingerprint,
   currentVersion,
   bumpVersion,
   getEvaluation,

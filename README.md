@@ -21,7 +21,9 @@
 生效范围按当前事件时间线的批号流向确定，**确定命中与因批号未知无法排除的批次都受控**并展示传播依据，
 原料资料或事件更正、补录、换线或清洗后同步刷新；**受控批次不得登记放行、标签卷或确认出货**，
 已有卷暂停贴用但不永久停用，关联已出货单转待评估、有效的继续流转结论转需重评、**隔离期间只能召回**；
-解除或流向变化使批次**脱离所有生效令后**才恢复后续操作，待评估单及历史处置不自动恢复。
+签发/解除/事件更正使批次生效隔离令集合变化时，相关出货单（含原本已待评估单据）的查询状态版本
+立即失效（旧版本提交 `409 VERSION_EXPIRED`、不产生处置记录），重新查询后按最新隔离状态判断，
+未受影响出货单版本不失效；解除或流向变化使批次**脱离所有生效令后**才恢复后续操作，待评估单及历史处置不自动恢复。
 仓管可为已有原料供应批号登记**一次非负整数克数的期初实物结存**，并以**唯一入库单号**记录后续
 **正整数克数入库**（启用计量后入库流水只增不改）；启用计量后新增、断网补录或更正加工事件时，
 该批号的每笔原料输入须填**正整数克数**，按批号累计领用不得超过**期初与入库之和**，未启用批号
@@ -912,8 +914,9 @@ curl -s http://localhost:3000/api/shipment-balances   # 受控批次同样 quara
   - **准予条件判定**：三条条件逐项 ✓/✗ 及未覆盖的过敏原。
 - **准予继续流转仅在三条同时成立时允许**：① 批次仍存在且可重新推导；② 当前有有效放行；
   ③ **出货快照覆盖当前过敏原**（当前集合是出货声明集合的子集，未声明项会逐条列出）。任一不满足，只能**召回**。
-- 提交在**一次事务**内重新核对：版本签名与有效期、该单**最新状态版本**、**最新上下文指纹**
-  （批次过敏原/有效放行/所用卷停用）。过期或查询后已被改动 → `409 VERSION_EXPIRED`，**拒绝且不产生记录**。
+- 提交在**一次事务**内重新核对：版本签名与有效期、该单**最新状态版本**、**最新版本指纹**
+  （批次过敏原/有效放行/所用卷停用的上下文指纹 **+ 批次“生效隔离令集合”指纹**）。
+  过期或查询后已被改动 → `409 VERSION_EXPIRED`，**拒绝且不产生记录**。
 - **记录只增不改**：同一单已有**有效（ACTIVE）结论**时重复提交一律拒绝
   （`409 DISPOSITION_EXISTS`，**用旧版本也不能覆盖新结论**）；处置行从不修改结论内容。
 - 此后**批次过敏原、有效放行或所用卷停用信息变化**时（事件/原料更正、整组换线确认应用、放行新增或删除），
@@ -925,10 +928,17 @@ curl -s http://localhost:3000/api/shipment-balances   # 受控批次同样 quara
 
 ### 状态版本（乐观并发）
 
-- 状态版本为**每单单调递增整数**（出货时 0；转待评估 +1；每次登记处置 +1），
-  评估视图同时返回一枚 **HMAC 签名令牌**（30 分钟有效；**服务重启后旧令牌作废**）与短码 `context_version`。
-- 查询后若该单状态版本被推进（他人先处置、单据新转待评估）或上下文指纹变化，
-  旧令牌提交即拒绝；处置成功后旧令牌立即失效。
+- 状态版本为**每单单调递增整数**（出货时 0；转待评估 +1；每次登记处置 +1；
+  **批次生效隔离令集合变化 +1**——见下），评估视图同时返回一枚 **HMAC 签名令牌**
+  （30 分钟有效；**服务重启后旧令牌作废**）与短码 `context_version`。
+- 查询后若该单状态版本被推进（他人先处置、单据新转待评估、**隔离令签发/解除或事件更正
+  使本批次生效隔离令集合变化**）或版本指纹变化，旧令牌提交即拒绝；处置成功后旧令牌立即失效。
+- **隔离令与状态版本**：签发隔离令、解除隔离令（批次仍被其它令覆盖也算集合变化）、
+  或事件更正/补录/整组换线经重算使批次**进出受控范围**时，受影响批次名下**全部出货单**
+  （含原本就已待评估的单据）状态版本立即推进，且生效令 id 集合进入版本指纹：
+  变化前查询的版本提交（无论 `CONTINUE` 还是 `RECALL`）一律 `409 VERSION_EXPIRED`、
+  **不产生处置记录**；**重新查询**后按最新隔离状态判断——隔离期间只能召回，
+  **脱离全部生效令后**才按原三条件判断是否可继续流转。未受影响出货单的版本不无故失效。
 
 ### HTTP API
 
@@ -1013,7 +1023,7 @@ curl -s http://localhost:3000/api/shipments/SHIP-0001/evaluation
 | 出货单不存在（评估/处置） | 404 | `SHIPMENT_NOT_FOUND` |
 | 非待评估单提交处置 | 409 | `SHIPMENT_NOT_REVIEWABLE` |
 | 条件不满足仍提交 CONTINUE | 409 | `CONTINUE_NOT_ALLOWED`（`details` 逐条原因） |
-| 版本过期（TTL/状态版本已前进/查询后上下文变化），**不产生记录** | 409 | `VERSION_EXPIRED` |
+| 版本过期（TTL/状态版本已前进/查询后上下文或生效隔离令集合变化），**不产生记录** | 409 | `VERSION_EXPIRED` |
 | 已有有效结论，重复提交（含旧版本）不得覆盖 | 409 | `DISPOSITION_EXISTS` |
 
 ## 原料供应批号与流向追溯（本轮新增）
@@ -1487,14 +1497,21 @@ curl -s -X DELETE http://localhost:3000/api/downtime-windows/3
     待评估单仍占用原分配量；
   - **已有标签卷暂停贴用但不永久停用**：核销贴用/作废 `409 ROLL_QUARANTINED`，
     卷保持 `ACTIVE`，脱离全部生效令后自动恢复贴用；
-  - **关联已出货单转待评估**（`PENDING_REVIEW`，终态不自动恢复），并推进该单状态版本；
+  - **关联已出货单转待评估**（`PENDING_REVIEW`，终态不自动恢复）；
+  - **生效隔离令集合变化即推进这些批次全部出货单的状态版本**：签发（新受控）、
+    解除（令集合减小；批次仍被其它令覆盖也算变化）或事件更正/补录/整组换线重算范围
+    （批次进出受控范围）时，受影响批次名下的出货单（**含原本就已待评估、本次不转状态
+    的单据**）状态版本立即 +1，生效令 id 集合同时进入评估版本指纹；变化前查询的版本
+    提交一律 `409 VERSION_EXPIRED` 且不产生处置记录，**未受影响出货单版本不失效**；
   - 这些出货单上**有效的“准予继续流转”结论转需重评**（STALE，召回结论不受影响）；
   - **隔离期间评估只能召回**：评估视图 `conditions.quarantined=true`，
-    提交 `CONTINUE` 被 `409 CONTINUE_NOT_ALLOWED` 拒绝，`RECALL` 正常落账。
+    提交 `CONTINUE` 被 `409 CONTINUE_NOT_ALLOWED` 拒绝，`RECALL` 正常落账；
+    **重新查询**后按最新状态判断，脱离全部生效令后才按原三条件恢复继续流转判定。
 - **解除**：必须录入**解除原因**与**操作人**（时间可选）；解除为终态
   （重复解除 `409 QUARANTINE_NOT_ACTIVE`），解除时的生效范围快照留痕（`lifted_scope`）。
   **批次脱离所有生效令后**才恢复放行/标签卷/出货登记与卷贴用，可出货余额随之恢复按
   「未停用卷剩余已贴用量」计算（多张令覆盖同一批次时，解除其中一张不足以恢复；停用卷始终为 0）；
+  解除同样推进曾覆盖批次出货单的状态版本（旧查询版本须重新获取），
   **待评估单及历史处置结论不自动恢复**。
 - **原子性**：签发、解除和范围变化与关联业务状态更新（出货单转待评估、结论转需重评）
   在**同一事务**内完成；任一环节失败整体回滚。
@@ -1514,7 +1531,7 @@ curl -s -X DELETE http://localhost:3000/api/downtime-windows/3
 | `POST /api/releases`、`POST /api/label-rolls`、`POST /api/shipments` | 受控批次明确拒绝（`409 BATCH_QUARANTINED`） |
 | `POST /api/label-rolls/:id/consume` | 受控批次的卷暂停贴用（`409 ROLL_QUARANTINED`，不永久停用） |
 | `POST /api/label-rolls/:id/usages/:usageId/corrections` | 受控批次的卷暂停核销更正（同样 `409 ROLL_QUARANTINED`，不推进修订号） |
-| `GET /api/shipments/:id/evaluation` | `current_state`/`conditions` 新增 `batch_quarantined`/`quarantine_orders`，准予判定含“未受隔离”条件 |
+| `GET /api/shipments/:id/evaluation` | `current_state`/`conditions` 新增 `batch_quarantined`/`quarantine_orders`，准予判定含“未受隔离”条件；签名版本指纹含批次“生效隔离令集合”，集合变化（签发/解除/事件更正重算）后旧版本提交 `409 VERSION_EXPIRED` |
 | 事件 `POST/PUT/DELETE`、原料 `PUT`、补录 `POST /api/backfills`、换线 `apply` | 响应形状不变，另附 `quarantine`（本次新受控/脱离受控的批次）；级联的待评估单与需重评结论并入既有 `pending_shipments`/`stale_dispositions` |
 | 换线 `preview` 的 `diff` | 另含 `quarantine_will_control`/`quarantine_will_release`（应用后将新受控/脱离受控的批次） |
 
@@ -1577,6 +1594,19 @@ VER=$(curl -s http://localhost:3000/api/shipments/SHIP-0001/evaluation | node -p
 curl -s -X POST http://localhost:3000/api/shipments/SHIP-0001/dispositions \
   -H 'Content-Type: application/json' \
   -d "{\"decision\":\"RECALL\",\"decided_by\":\"质检员-陈静\",\"basis\":\"批号隔离待查，先召回在途品\",\"version\":\"$VER\"}"
+
+# 4b) 生效隔离令集合变化使旧版本立即失效（即便单据签发前就已待评估、即便提交的是召回）：
+#     另开会话解除隔离令后，再用上面的 $VER 提交（不重新查询）
+curl -s -X POST http://localhost:3000/api/quarantine-orders/1/lift \
+  -H 'Content-Type: application/json' -d '{"lifted_by":"质检主管-刘芳","lift_reason":"复检合格"}'
+curl -s -X POST http://localhost:3000/api/shipments/SHIP-0001/dispositions \
+  -H 'Content-Type: application/json' \
+  -d "{\"decision\":\"RECALL\",\"decided_by\":\"质检员-陈静\",\"basis\":\"用解除前旧版本提交\",\"version\":\"$VER\"}"
+# -> 409 { code:"VERSION_EXPIRED",
+#         error:"查询后批次过敏原、有效放行、所用卷停用信息或生效隔离令集合已变化，…（本次不产生记录）" }
+#    且不产生任何处置记录；须重新 GET evaluation 取新版本后再提交。
+#    多令覆盖时只解除其中一张（批次仍受控、quarantine.released 为空）同样令旧版本失效。
+#    未受影响出货单（其他批次）的版本不推进、旧版本仍可正常提交。
 
 # 5) 流向变化同步刷新：把 BATCH-002 的牛奶批号改为正常批 SUP-MILK-20260925-A，
 #    BATCH-002/003 脱离生效范围（响应 quarantine.released 给出批次）

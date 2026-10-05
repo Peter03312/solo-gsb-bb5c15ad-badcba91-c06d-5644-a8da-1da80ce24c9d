@@ -19,6 +19,7 @@
     "test:backfill": "node scripts/test-backfill.js",
     "test:downtime": "node scripts/test-downtime.js",
     "test:quarantine": "node scripts/test-quarantine.js",
+    "test:quarantine-versions": "node scripts/test-quarantine-versions.js",
     "test:inventory": "node scripts/test-inventory.js",
     "test:time-instants": "node scripts/test-time-instants.js",
     "test:calendar-time": "node scripts/test-calendar-time.js"

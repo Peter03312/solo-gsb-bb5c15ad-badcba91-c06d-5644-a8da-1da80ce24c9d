@@ -11,8 +11,12 @@
 // 受控批次的约束（在各自写入接口事务内核对）：
 //   - 不得登记放行、不得登记标签卷、不得确认出货；
 //   - 已有标签卷暂停贴用（派生状态，不永久停用；脱离全部生效令后自动恢复贴用）；
-//   - 关联已出货单转待评估（终态，不自动恢复），有效的“准予继续流转”结论转需重评，
-//     隔离期间评估只能登记召回。
+//   - 关联已出货单转待评估（终态，不自动恢复）；
+//   - 签发/解除或事件更正使批次“生效隔离令集合”变化时，相关出货单（含原本已待评估
+//     的单据）状态版本立即推进，且隔离状态进入评估版本指纹：变化前的查询版本提交一律
+//     409 VERSION_EXPIRED、不产生处置记录；重新查询后按最新隔离状态判断（隔离期间只能
+//     召回，脱离全部生效令后才按原条件判断是否可继续流转）。未受影响出货单版本不失效。
+//     有效的“准予继续流转”结论随新受控转需重评；解除不自动改动任何历史结论。
 //
 // 范围刷新：原料资料或事件更正/删除、断网补录、整组换线或清洗变化后，recompute 在
 // 同一事务内调用 syncScopes 重算全部生效令的范围并级联业务状态（原子完成）。
@@ -109,13 +113,17 @@ function syncScopes(db) {
       ORDER BY q.id`
   ).all();
 
-  const before = new Set(
-    db.prepare(
-      `SELECT DISTINCT qs.batch_id FROM quarantine_scope qs
-         JOIN quarantine_orders q ON q.id = qs.order_id
-        WHERE q.status = 'ACTIVE'`
-    ).all().map((r) => r.batch_id)
-  );
+  // 变化前：批次 -> 生效令 id 集合（不只是是否受控：多令覆盖时，令集合增删也算变化）。
+  const beforeMap = new Map();
+  for (const r of db.prepare(
+    `SELECT qs.batch_id, qs.order_id FROM quarantine_scope qs
+       JOIN quarantine_orders q ON q.id = qs.order_id
+      WHERE q.status = 'ACTIVE'`
+  ).all()) {
+    if (!beforeMap.has(r.batch_id)) beforeMap.set(r.batch_id, new Set());
+    beforeMap.get(r.batch_id).add(r.order_id);
+  }
+  const before = new Set(beforeMap.keys());
 
   // 整体重写生效令范围（解除令的范围行已在解除时删除）。
   db.prepare(
@@ -150,11 +158,22 @@ function syncScopes(db) {
 
   const newly = [...after].filter((b) => !before.has(b));
   const released = [...before].filter((b) => !after.has(b));
+  // 生效令集合实际变化的批次：新受控、脱离受控，或仍受控但覆盖令增删
+  // （如两张令覆盖一批次、解除其中一张）。这些批次的出货单查询版本须全部失效。
+  const changed = [];
+  for (const bid of new Set([...before, ...after])) {
+    const prev = beforeMap.get(bid);
+    const cur = ordersByBatch.get(bid);
+    if (!sameOrderSet(prev, cur)) changed.push(bid);
+  }
 
   let cascade = { pendingShipments: [], staleDispositions: [] };
   if (newly.length) {
     cascade = cascadeNewlyControlled(db, newly, ordersByBatch);
   }
+  // 生效令集合变化即推进这些批次全部出货单的状态版本（含原本已待评估的单据；
+  // 转待评估的版本推进也在此统一完成，避免同一单重复推进）。
+  bumpShipmentVersions(db, changed);
 
   const codeOf = batchCodeMapper(db);
   return {
@@ -165,6 +184,32 @@ function syncScopes(db) {
   };
 }
 
+// 比较批次变化前/后的生效令 id 集合是否相同（任一为 undefined 视为空集）。
+function sameOrderSet(prevSet, curOrders) {
+  const prev = prevSet ? prevSet.size : 0;
+  const cur = curOrders ? curOrders.length : 0;
+  if (prev !== cur) return false;
+  if (cur === 0) return true;
+  return curOrders.every((o) => prevSet.has(o.id));
+}
+
+// 推进给定批次名下全部出货单的状态版本（不限单据状态）：
+// 生效隔离令集合变化后，变化前查询取得的版本立即过期，须重新查询。
+// 批次不存在（batch_id 已置空）的出货单不在其列，版本不无故失效。
+function bumpShipmentVersions(db, batchIds) {
+  if (!batchIds || !batchIds.length) return;
+  const evaluation = require('./evaluation');
+  const sel = db.prepare('SELECT id FROM shipments WHERE batch_id = ? ORDER BY id');
+  const bumped = new Set();
+  for (const bid of batchIds) {
+    for (const s of sel.all(bid)) {
+      if (bumped.has(s.id)) continue;
+      bumped.add(s.id);
+      evaluation.bumpVersion(db, s.id);
+    }
+  }
+}
+
 function batchCodeMapper(db) {
   const map = new Map(
     db.prepare('SELECT id, code FROM batches').all().map((b) => [b.id, b.code])
@@ -173,11 +218,12 @@ function batchCodeMapper(db) {
 }
 
 // 新受控批次的级联（与范围刷新同一事务）：
-//   1) 关联已出货单 SHIPPED -> PENDING_REVIEW（终态，不自动恢复），并推进状态版本；
+//   1) 关联已出货单 SHIPPED -> PENDING_REVIEW（终态，不自动恢复）；
 //   2) 这些批次出货单上仍为 ACTIVE 的“准予继续流转”结论 -> STALE（需重新评估）；
 //      召回结论不受影响（隔离期间召回始终允许）。
+// 状态版本推进由 syncScopes 对“生效令集合变化批次”的全部出货单统一完成
+// （含此处新转待评估与原本已待评估的单据，每单恰好一次），本函数不再单独推进。
 function cascadeNewlyControlled(db, batchIds, ordersByBatch) {
-  const evaluation = require('./evaluation');
   const shipments = require('./shipments');
 
   const pendingShipments = [];
@@ -210,8 +256,6 @@ function cascadeNewlyControlled(db, batchIds, ordersByBatch) {
         '隔离期间只能登记召回；待评估状态不自动恢复';
       const info = updShip.run(reason, s.id);
       if (info.changes) {
-        // 转待评估即推进状态版本：此前查询取得的版本立即过期。
-        evaluation.bumpVersion(db, s.id);
         pendingShipments.push(shipments.formatShipment(
           db.prepare('SELECT * FROM shipments WHERE id = ?').get(s.id), db));
       }
@@ -361,6 +405,9 @@ function liftOrder(db, id, body) {
     released = snapshot
       .filter((r) => !still.has(r.batch_id))
       .map((r) => ({ batch_id: r.batch_id, batch_code: r.batch_code }));
+    // 本令覆盖的每个批次其“生效令集合”都少了一令（即便仍被其它令覆盖，集合也已变化）：
+    // 这些批次全部出货单的状态版本统一推进，变化前查询的版本提交一律 VERSION_EXPIRED。
+    bumpShipmentVersions(db, snapshot.map((r) => r.batch_id));
   });
   tx();
 
